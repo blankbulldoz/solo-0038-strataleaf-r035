@@ -24,6 +24,17 @@ CREATE TABLE IF NOT EXISTS index_values (
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
 CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mirror_sessions (
+ name TEXT PRIMARY KEY, source_collection TEXT NOT NULL, collection TEXT NOT NULL,
+ predicate TEXT NOT NULL,
+ predicate_fingerprint TEXT NOT NULL, source_id TEXT NOT NULL, target_rev INTEGER NOT NULL,
+ source_floor INTEGER NOT NULL, after_key TEXT, phase TEXT NOT NULL,
+ view_digest TEXT, key_count INTEGER, certificate TEXT);
+CREATE TABLE IF NOT EXISTS mirror_entries (
+ session TEXT NOT NULL, key TEXT NOT NULL, source_rev INTEGER NOT NULL,
+ local_rev INTEGER NOT NULL, body_digest TEXT NOT NULL,
+ PRIMARY KEY(session,key), FOREIGN KEY(session) REFERENCES mirror_sessions(name) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS mirror_entry_session ON mirror_entries(session);
 """
 
 

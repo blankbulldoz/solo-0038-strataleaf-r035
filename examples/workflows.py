@@ -2,7 +2,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError
+from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, MirrorError, ReadOnly, SnapshotTooOld, ReplicationError
 
 SCHEMA = {"fields": {"region": "string", "sequence": "integer", "code": "string"}, "required": ["region", "sequence"]}
 
@@ -145,6 +145,56 @@ def run(flow):
                           "duplicate": rejected(lambda: db.transfer.import_lines("copy_segments", exported["lines"]), Conflict)}
                 if len(db.query("copy_segments").records) != 6:
                     raise RuntimeError("logical import differs")
+            elif flow == "mirror":
+                predicate = {"field": "sequence", "op": "ge", "value": 0}
+                db.catalog.create("mirror_segments", SCHEMA)
+                db.mirror.open("page_copy", "segments", "mirror_segments", predicate)
+                replay = None
+                page = db.transfer.export_page("segments", limit=2, predicate=predicate, revision=first)
+                while page is not None:
+                    db.mirror.apply_page("page_copy", page)
+                    if replay is None:
+                        replay = db.mirror.apply_page("page_copy", page)  # identical redelivery
+                        if replay["applied"] != 0:
+                            raise RuntimeError("redelivered page was applied twice")
+                    if page["cursor"] is None:
+                        break
+                    page = db.transfer.export_page("segments", limit=2, predicate=predicate,
+                                                   revision=first, cursor=page["cursor"])
+                final = db.mirror.status("page_copy")
+                if final["phase"] != "synced" or not db.mirror.verify("page_copy")["ok"]:
+                    raise RuntimeError("mirror did not converge on the fixed view")
+                certificate = db.mirror.certificate("page_copy")
+                handoff = db.mirror.handoff("page_copy")
+                if db.mirror.reopen(handoff["token"])["phase"] != "synced":
+                    raise RuntimeError("handoff reopen failed")
+                # evolve the source, then restart the mirror onto a fixed newer view
+                db.batch().delete("segments", "seg_01").commit()
+                db.batch().put("segments", "seg_02",
+                               {"region": "east", "sequence": 22, "code": "c2"}, expected=1).commit()
+                db.batch().put("segments", "seg_00b",
+                               {"region": "west", "sequence": 99, "code": "cb"}).commit()
+                restarted = db.mirror.restart("page_copy", db.revision)
+                verification = db.mirror.verify("page_copy")
+                if db.mirror.read_mirror("page_copy", "seg_01") is not None or \
+                   db.mirror.read_mirror("page_copy", "seg_02").document["sequence"] != 22 or \
+                   db.mirror.read_mirror("page_copy", "seg_00b") is None:
+                    raise RuntimeError("restart reconciliation missed a revocation or rebuild")
+                # strict old-snapshot refusal once the retained floor advances past a view
+                db.retention.pin("guard", db.revision)
+                db.retention.compact(db.revision)
+                aged = rejected(lambda: db.transfer.export_page(
+                    "segments", limit=2, predicate=predicate, revision=first), SnapshotTooOld)
+                db.retention.unpin("guard")
+                db.mirror.open("incomplete", "segments", "mirror_segments", predicate)
+                partial_cert = rejected(lambda: db.mirror.certificate("incomplete"), MirrorError)
+                abandoned = db.mirror.abandon("incomplete")
+                output = {"first_page_replay": replay, "synced": final,
+                          "certificate": {k: certificate[k] for k in
+                                          ("coverage", "revision", "key_count", "view_digest")},
+                          "handoff_reopen": "synced", "restart": restarted,
+                          "verify": verification, "aged_view": aged,
+                          "partial_certificate": partial_cert, "abandoned": abandoned}
             else:
                 raise ValueError("unknown example workflow: " + flow)
             print(json.dumps({"workflow": flow, "result": output}, ensure_ascii=False, sort_keys=True, default=str))
